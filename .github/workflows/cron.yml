@@ -1,0 +1,22 @@
+name: Update friendly titles
+
+on:
+  schedule:
+    - cron: "0 18 * * *"   # roda todo dia 18:00 UTC (pode mudar)
+  workflow_dispatch:       # permite rodar manualmente
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm i
+      - run: node update-friendly-titles.js
+        env:
+          TOKEN: ${{ secrets.SHOP_ADMIN_API_TOKEN }}
+          API_VERSION: "2024-10"
+          MF_NAMESPACE: "custom"
+          MF_KEY: "friendly_title_first_line"
