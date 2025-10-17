@@ -55,6 +55,7 @@ const LIST_PRODUCTS = `
   }
 `;
 
+
 const SET_METAFIELD = `
   mutation SetMetafield($ownerId: ID!, $value: String!) {
     metafieldsSet(metafields: [{
