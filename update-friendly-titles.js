@@ -1,40 +1,26 @@
 // update-friendly-titles.js
-import fetch from 'node-fetch';
+// Atualiza o metafield custom.friendly_title_first_line com a 1ª linha da descrição
 
-const TOKEN = process.env.TOKEN;
-const API_VERSION = process.env.API_VERSION || '2024-10';
-const STORE = 'xz5315-nz.myshopify.com'; // seu domínio
-const MF_NAMESPACE = process.env.MF_NAMESPACE || 'custom';
-const MF_KEY = process.env.MF_KEY || 'friendly_title_first_line';
+import fetch from "node-fetch";
 
-// helpers
-async function shopifyGraphQL(query, variables) {
-  const url = `https://${STORE}/admin/api/${API_VERSION}/graphql.json`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': TOKEN,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ query, variables })
-  });
+// ← ajuste aqui se quiser mudar via Actions (mas já deixei seu domínio como padrão)
+const SHOP = process.env.SHOP_DOMAIN || "xz5315-nz.myshopify.com";
+const API_VERSION = process.env.API_VERSION || "2024-10";
+const TOKEN = process.env.TOKEN; // GH Secret SHOP_ADMIN_API_TOKEN
+const MF_NAMESPACE = process.env.MF_NAMESPACE || "custom";
+const MF_KEY = process.env.MF_KEY || "friendly_title_first_line";
 
-  // Log detalhado em caso de erro HTTP
-  if (!res.ok) {
-    const text = await res.text();
-    const msg = `HTTP ${res.status} ${res.statusText}\nURL: ${url}\nResponse:\n${text}`;
-    throw new Error(msg);
-  }
-
-  const data = await res.json();
-
-  if (data.errors) {
-    throw new Error('GraphQL top-level errors: ' + JSON.stringify(data.errors, null, 2));
-  }
-  return data.data;
+if (!TOKEN) {
+  throw new Error("Faltou o TOKEN (SHOP_ADMIN_API_TOKEN) nos secrets.");
 }
 
-// queries/mutations
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const HEADERS = {
+  "Content-Type": "application/json",
+  "X-Shopify-Access-Token": TOKEN,
+};
+
+// ⚠️ Query correta: usa metafield (singular), sem keys/withDefinitions
 const LIST_PRODUCTS = `
   query ListProducts($cursor: String) {
     products(first: 100, after: $cursor) {
@@ -55,74 +41,96 @@ const LIST_PRODUCTS = `
   }
 `;
 
-
 const SET_METAFIELD = `
-  mutation SetMetafield($ownerId: ID!, $value: String!) {
-    metafieldsSet(metafields: [{
-      ownerId: $ownerId,
-      namespace: "${MF_NAMESPACE}",
-      key: "${MF_KEY}",
-      type: "single_line_text_field",
-      value: $value
-    }]) {
-      userErrors { field message }
+  mutation SetMeta($ownerId: ID!, $namespace: String!, $key: String!, $value: String!) {
+    metafieldsSet(
+      metafields: [{
+        ownerId: $ownerId,
+        namespace: $namespace,
+        key: $key,
+        type: "single_line_text_field",
+        value: $value
+      }]
+    ) {
       metafields { id }
+      userErrors { field message }
     }
   }
 `;
 
-// pegar primeira linha amigável
-function firstLineFromDescription(html) {
-  if (!html) return null;
-  const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!text) return null;
-  const firstDot = text.indexOf('.');
-  const cleaned = firstDot >= 0 ? text.slice(0, firstDot + 1) : text;
-  return cleaned.length > 70 ? cleaned.slice(0, 67) + '…' : cleaned;
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (json.errors) {
+    // Deixa claro no log o erro retornado pelo GraphQL
+    console.error(JSON.stringify(json.errors, null, 2));
+    throw new Error("GraphQL top-level errors");
+  }
+  return json.data;
 }
 
-(async () => {
-  if (!TOKEN) {
-    console.error('ERRO: TOKEN ausente. Defina o secret SHOP_ADMIN_API_TOKEN no GitHub.');
-    process.exit(1);
-  }
-  console.log(`Store: ${STORE} | API: ${API_VERSION} | Metafield: ${MF_NAMESPACE}.${MF_KEY}`);
-
+async function* productsIterator() {
   let cursor = null;
-  let updated = 0, skipped = 0, total = 0;
-
   while (true) {
-    const data = await shopifyGraphQL(LIST_PRODUCTS, { cursor });
-    const edges = data.products.edges;
-    for (const { node } of edges.map(e => e)) {
-      total++;
-      const friendly = firstLineFromDescription(node.description);
-      if (!friendly) { skipped++; continue; }
-
-      const existing = node.metafield?.value || null;
-      if (existing === friendly) { skipped++; continue; }
-
-      const result = await shopifyGraphQL(SET_METAFIELD, {
-        ownerId: node.id,
-        value: friendly
-      });
-
-      const errs = result.metafieldsSet?.userErrors || [];
-      if (errs.length) {
-        console.error('userErrors:', JSON.stringify(errs, null, 2), 'product:', node.id);
-        // não para a execução; segue pro próximo
-        continue;
-      }
-      updated++;
-      console.log(`✔ Atualizado: ${node.title} → "${friendly}"`);
-    }
-
+    const data = await gql(LIST_PRODUCTS, { cursor });
+    const edges = data.products.edges || [];
+    for (const edge of edges) yield edge.node;
     if (!data.products.pageInfo.hasNextPage) break;
     cursor = edges[edges.length - 1].cursor;
   }
+}
 
-  console.log(`Done. Updated: ${updated}, Skipped: ${skipped}, Total scanned: ${total}`);
-})().catch(err => {
-  console.error('FALHA:', err.message || err);
+function firstLineFromDescription(html) {
+  if (!html) return "";
+  // tira tags html e pega a primeira linha não vazia
+  const text = html
+    .replace(/<\/?[^>]+(>|$)/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!text) return "";
+  // “primeira linha” = até o primeiro ponto final ou quebra “forte”
+  const byBreak = text.split(/[\r\n]+/)[0];
+  const byDot = byBreak.split(". ")[0];
+  return (byDot || byBreak).trim();
+}
+
+async function run() {
+  let touched = 0;
+  for await (const p of productsIterator()) {
+    const current = p.metafield?.value || "";
+    const candidate = firstLineFromDescription(p.description);
+
+    // se não tem nada pra salvar, pula
+    if (!candidate) continue;
+
+    // se já está igual, pula
+    if (current && current.trim() === candidate.trim()) continue;
+
+    const result = await gql(SET_METAFIELD, {
+      ownerId: p.id,
+      namespace: MF_NAMESPACE,
+      key: MF_KEY,
+      value: candidate,
+    });
+
+    const errs = result.metafieldsSet.userErrors || [];
+    if (errs.length) {
+      console.warn(`⚠️ ${p.id} (${p.title}) — userErrors:`, errs);
+      continue;
+    }
+    touched++;
+    console.log(`✅ Atualizado: ${p.title} → "${candidate}"`);
+  }
+  console.log(`\n✔️ Finalizado. Produtos atualizados: ${touched}`);
+}
+
+run().catch((e) => {
+  console.error("❌ Falhou:", e.message);
   process.exit(1);
 });
