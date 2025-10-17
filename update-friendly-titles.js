@@ -1,132 +1,127 @@
-import fetch from "node-fetch";
+// update-friendly-titles.js
+import fetch from 'node-fetch';
 
-// ✅ seu domínio fixo aqui:
-const SHOP = "xz5315-nz.myshopify.com";
+const TOKEN = process.env.TOKEN;
+const API_VERSION = process.env.API_VERSION || '2024-10';
+const STORE = 'xz5315-nz.myshopify.com'; // seu domínio
+const MF_NAMESPACE = process.env.MF_NAMESPACE || 'custom';
+const MF_KEY = process.env.MF_KEY || 'friendly_title_first_line';
 
-// 🔒 o token vem dos “secrets” do GitHub (SHOP_ADMIN_API_TOKEN)
-const TOKEN = process.env.TOKEN || process.env.SHOP_ADMIN_API_TOKEN;
-
-const API_VERSION = "2024-10";
-const NAMESPACE = "custom";
-const KEY = "friendly_title_first_line";
-// Opcional: limite por data se quiser processar só produtos recentes
-const SINCE = process.env.SINCE || ""; // ex: "2025-01-01T00:00:00Z"
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function firstLineFromHTML(html = "") {
-  let body = html.replace(/<br\s*\/?>/gi, "\n").replace(/\r/g, "");
-  let first = "";
-  const pClose = body.toLowerCase().indexOf("</p>");
-  if (pClose !== -1) {
-    const afterPOpen = body.split(/<p[^>]*>/i)[1] || "";
-    first = afterPOpen.split(/<\/p>/i)[0] || "";
-  } else {
-    first = body.replace(/<[^>]*>/g, "").split("\n")[0] || "";
-  }
-  first = first.replace(/<[^>]*>/g, "").trim();
-  if (!first) return "";
-  if (first.length > 200) return first.slice(0, 197).trim() + "…";
-  return first;
-}
-
-async function gql(query, variables = {}) {
-  const res = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
-    method: "POST",
+// helpers
+async function shopifyGraphQL(query, variables) {
+  const url = `https://${STORE}/admin/api/${API_VERSION}/graphql.json`;
+  const res = await fetch(url, {
+    method: 'POST',
     headers: {
-      "X-Shopify-Access-Token": TOKEN,
-      "Content-Type": "application/json",
+      'X-Shopify-Access-Token': TOKEN,
+      'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({ query, variables })
   });
-  const json = await res.json();
-  if (json.errors) throw new Error(JSON.stringify(json.errors));
-  return json.data;
+
+  // Log detalhado em caso de erro HTTP
+  if (!res.ok) {
+    const text = await res.text();
+    const msg = `HTTP ${res.status} ${res.statusText}\nURL: ${url}\nResponse:\n${text}`;
+    throw new Error(msg);
+  }
+
+  const data = await res.json();
+
+  if (data.errors) {
+    throw new Error('GraphQL top-level errors: ' + JSON.stringify(data.errors, null, 2));
+  }
+  return data.data;
 }
 
-async function* productsIterator() {
-  let hasNextPage = true;
-  let cursor = null;
-  const sinceFilter = SINCE ? `, query: "updated_at:>=${SINCE}"` : "";
-
-  while (hasNextPage) {
-    const data = await gql(
-      `
-      query GetProducts($cursor: String) {
-        products(first: 100, after: $cursor${sinceFilter}) {
-          pageInfo { hasNextPage }
-          edges {
-            cursor
-            node {
-              id
-              title
-              bodyHtml
-              metafields(first: 1, namespace: "${NAMESPACE}", keys: ["${KEY}"]) {
-                edges { node { key value } }
-              }
-            }
+// queries/mutations
+const LIST_PRODUCTS = `
+  query ListProducts($cursor: String) {
+    products(first: 100, after: $cursor) {
+      edges {
+        cursor
+        node {
+          id
+          title
+          description
+          metafield(namespace: "${MF_NAMESPACE}", key: "${MF_KEY}") {
+            id
+            value
           }
         }
-      }`,
-      { cursor }
-    );
-
-    for (const edge of data.products.edges) {
-      yield edge.node;
-      cursor = edge.cursor;
-    }
-    hasNextPage = data.products.pageInfo.hasNextPage;
-    await sleep(400); // respeita limites
-  }
-}
-
-async function updateMetafield(productId, value) {
-  const input = {
-    id: productId,
-    metafields: [
-      {
-        namespace: NAMESPACE,
-        key: KEY,
-        type: "single_line_text_field",
-        value,
-      },
-    ],
-  };
-
-  const data = await gql(
-    `
-    mutation UpdateProduct($input: ProductInput!) {
-      productUpdate(input: $input) {
-        userErrors { field message }
       }
-    }`,
-    { input }
-  );
-  const errs = data.productUpdate.userErrors;
-  if (errs?.length) console.error("Update error:", errs);
+      pageInfo { hasNextPage }
+    }
+  }
+`;
+
+const SET_METAFIELD = `
+  mutation SetMetafield($ownerId: ID!, $value: String!) {
+    metafieldsSet(metafields: [{
+      ownerId: $ownerId,
+      namespace: "${MF_NAMESPACE}",
+      key: "${MF_KEY}",
+      type: "single_line_text_field",
+      value: $value
+    }]) {
+      userErrors { field message }
+      metafields { id }
+    }
+  }
+`;
+
+// pegar primeira linha amigável
+function firstLineFromDescription(html) {
+  if (!html) return null;
+  const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  const firstDot = text.indexOf('.');
+  const cleaned = firstDot >= 0 ? text.slice(0, firstDot + 1) : text;
+  return cleaned.length > 70 ? cleaned.slice(0, 67) + '…' : cleaned;
 }
 
-async function run() {
-  let updated = 0,
-    skipped = 0;
+(async () => {
+  if (!TOKEN) {
+    console.error('ERRO: TOKEN ausente. Defina o secret SHOP_ADMIN_API_TOKEN no GitHub.');
+    process.exit(1);
+  }
+  console.log(`Store: ${STORE} | API: ${API_VERSION} | Metafield: ${MF_NAMESPACE}.${MF_KEY}`);
 
-  for await (const p of productsIterator()) {
-    const current = p.metafields.edges?.[0]?.node?.value || "";
-    const friendly = firstLineFromHTML(p.bodyHtml || "") || p.title;
+  let cursor = null;
+  let updated = 0, skipped = 0, total = 0;
 
-    if (current !== friendly) {
-      await updateMetafield(p.id, friendly);
+  while (true) {
+    const data = await shopifyGraphQL(LIST_PRODUCTS, { cursor });
+    const edges = data.products.edges;
+    for (const { node } of edges.map(e => e)) {
+      total++;
+      const friendly = firstLineFromDescription(node.description);
+      if (!friendly) { skipped++; continue; }
+
+      const existing = node.metafield?.value || null;
+      if (existing === friendly) { skipped++; continue; }
+
+      const result = await shopifyGraphQL(SET_METAFIELD, {
+        ownerId: node.id,
+        value: friendly
+      });
+
+      const errs = result.metafieldsSet?.userErrors || [];
+      if (errs.length) {
+        console.error('userErrors:', JSON.stringify(errs, null, 2), 'product:', node.id);
+        // não para a execução; segue pro próximo
+        continue;
+      }
       updated++;
-    } else {
-      skipped++;
+      console.log(`✔ Atualizado: ${node.title} → "${friendly}"`);
     }
-    await sleep(250);
+
+    if (!data.products.pageInfo.hasNextPage) break;
+    cursor = edges[edges.length - 1].cursor;
   }
 
-  console.log(`Done. Updated: ${updated}, Skipped: ${skipped}`);
-}
-
-run().catch((err) => {
-  console.error(err);
+  console.log(`Done. Updated: ${updated}, Skipped: ${skipped}, Total scanned: ${total}`);
+})().catch(err => {
+  console.error('FALHA:', err.message || err);
   process.exit(1);
 });
